@@ -200,7 +200,7 @@ spec:
               echo "DB is ready!"
       containers:
         - name: backend
-          image: 629068384298.dkr.ecr.ap-south-1.amazonaws.com/jerney-backend:6c5b21a
+          image: 629068384298.dkr.ecr.ap-south-1.amazonaws.com/jerney-backend:dd19fe4
           ports:
             - containerPort: 5000
               protocol: TCP
@@ -307,7 +307,7 @@ spec:
           effect: "NoSchedule"
       containers:
         - name: frontend
-          image: 629068384298.dkr.ecr.ap-south-1.amazonaws.com/jerney-frontend:6c5b21a
+          image: 629068384298.dkr.ecr.ap-south-1.amazonaws.com/jerney-frontend:dd19fe4
           ports:
             - containerPort: 8080
               protocol: TCP
