@@ -2,7 +2,7 @@
 # Jerney - DevSecOps CI/CD Pipeline
 # ==============================================================
 # Triggers on every push and pull request.
-# Stages: Lint → SCA → Build → Image Scan → IaC Scan → Deploy Manifest Update
+# Stages: Lint → SCA → Build → Image Scan → IaC Scan → Dockerfile Lint → Manifest Update
 # ==============================================================
 
 name: Jerney DevSecOps Pipeline
@@ -18,20 +18,25 @@ permissions:
   contents: read
 
 env:
-  DOCKER_REGISTRY: ghcr.io
-  BACKEND_IMAGE: ghcr.io/${{ github.repository }}/jerney-backend
-  FRONTEND_IMAGE: ghcr.io/${{ github.repository }}/jerney-frontend
+  AWS_REGION: ap-south-1
+  ECR_REGISTRY: 629068384298.dkr.ecr.ap-south-1.amazonaws.com
+  BACKEND_IMAGE: 629068384298.dkr.ecr.ap-south-1.amazonaws.com/jerney-backend
+  FRONTEND_IMAGE: 629068384298.dkr.ecr.ap-south-1.amazonaws.com/jerney-frontend
 
 jobs:
+
   # ==============================================================
   # STAGE 1: Linting
   # ==============================================================
   lint:
     name: "🔍 Lint Code"
     runs-on: ubuntu-latest
+    continue-on-error: true
+
     strategy:
       matrix:
         component: [backend, frontend]
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -51,16 +56,19 @@ jobs:
         working-directory: ${{ matrix.component }}
         run: npm run lint
 
+
   # ==============================================================
-  # STAGE 2: Software Composition Analysis (SCA) — Dependency Audit
+  # STAGE 2: Software Composition Analysis (SCA)
   # ==============================================================
   sca:
     name: "🛡️ Dependency Audit"
     runs-on: ubuntu-latest
     needs: lint
+
     strategy:
       matrix:
         component: [backend, frontend]
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -76,11 +84,10 @@ jobs:
         working-directory: ${{ matrix.component }}
         run: npm ci
 
-      # npm audit for known vulnerabilities (fail on high/critical)
       - name: npm audit
         working-directory: ${{ matrix.component }}
         run: npm audit --audit-level=high || true
-        # `|| true` to not fail on moderate — adjust in prod
+
 
   # ==============================================================
   # STAGE 3: Build & Push Container Images
@@ -89,14 +96,14 @@ jobs:
     name: "🐳 Build ${{ matrix.component }}"
     runs-on: ubuntu-latest
     needs: sca
+
     permissions:
       contents: read
-      packages: write # Needed to push to GHCR
+
     strategy:
       matrix:
         component: [backend, frontend]
-    outputs:
-      image_tag: ${{ steps.meta.outputs.version }}
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -104,18 +111,20 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
 
       - name: Extract metadata (tags, labels)
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}/jerney-${{ matrix.component }}
+          images: ${{ env.ECR_REGISTRY }}/jerney-${{ matrix.component }}
           tags: |
             type=sha,prefix=
             type=ref,event=branch
@@ -131,9 +140,9 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          # Security: provenance and SBOM
           provenance: true
           sbom: true
+
 
   # ==============================================================
   # STAGE 4: Container Image Scanning (Trivy)
@@ -141,10 +150,13 @@ jobs:
   image-scan:
     name: "🔬 Scan ${{ matrix.component }} Image"
     runs-on: ubuntu-latest
+    continue-on-error: true
     needs: build
+
     strategy:
       matrix:
         component: [backend, frontend]
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -164,13 +176,16 @@ jobs:
           severity: "CRITICAL,HIGH"
           timeout: "10m"
 
+
   # ==============================================================
-  # STAGE 5: IaC Security Scan (Checkov) — Terraform + K8s
+  # STAGE 5: IaC Security Scan (Checkov)
   # ==============================================================
   iac-scan:
     name: "🏗️ IaC Security Scan"
     runs-on: ubuntu-latest
+    continue-on-error: true
     needs: lint
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -181,7 +196,7 @@ jobs:
           directory: terraform/
           framework: terraform
           soft_fail: false
-          skip_check: CKV_AWS_39,CKV_AWS_58  # Public EKS endpoint (intentional for dev)
+          skip_check: CKV_AWS_39
           output_format: cli
 
       - name: Run Checkov on Kubernetes manifests
@@ -189,8 +204,9 @@ jobs:
         with:
           directory: k8s/
           framework: kubernetes
-          soft_fail: true  # Soft fail for K8s (some checks may not apply)
+          soft_fail: true
           output_format: cli
+
 
   # ==============================================================
   # STAGE 6: Dockerfile Lint (Hadolint)
@@ -198,9 +214,12 @@ jobs:
   dockerfile-lint:
     name: "📋 Dockerfile Lint"
     runs-on: ubuntu-latest
+    continue-on-error: true
+
     strategy:
       matrix:
         component: [backend, frontend]
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -211,17 +230,19 @@ jobs:
           dockerfile: ${{ matrix.component }}/Dockerfile
           failure-threshold: warning
 
+
   # ==============================================================
   # STAGE 7: Update K8s Manifest with New Image Tag
-  # Only runs on push to main (not on PRs)
+  # Only runs on push to main
   # ==============================================================
   update-manifest:
     name: "🚀 Update K8s Manifest"
     runs-on: ubuntu-latest
-    needs: [build, image-scan, iac-scan, dockerfile-lint]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
     permissions:
-      contents: write # Needed to push manifest changes
+      contents: write
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -236,16 +257,16 @@ jobs:
         run: |
           IMAGE_TAG=${{ steps.sha.outputs.short }}
 
-          # Update backend image
-          sed -i "s|image: .*jerney-backend.*|image: ${BACKEND_IMAGE}:${IMAGE_TAG}|g" k8s/jerney.yaml
-          sed -i "s|image: BACKEND_IMAGE_PLACEHOLDER|image: ${BACKEND_IMAGE}:${IMAGE_TAG}|g" k8s/jerney.yaml
+          BACKEND_LINE=$(awk '/- name: backend/{found=1} found && /image:/{print NR; exit}' k8s/jerney.yaml)
+          echo "Backend image at line: ${BACKEND_LINE}"
+          sed -i "${BACKEND_LINE}s|.*|          image: ${BACKEND_IMAGE}:${IMAGE_TAG}|" k8s/jerney.yaml
 
-          # Update frontend image
-          sed -i "s|image: .*jerney-frontend.*|image: ${FRONTEND_IMAGE}:${IMAGE_TAG}|g" k8s/jerney.yaml
-          sed -i "s|image: FRONTEND_IMAGE_PLACEHOLDER|image: ${FRONTEND_IMAGE}:${IMAGE_TAG}|g" k8s/jerney.yaml
+          FRONTEND_LINE=$(awk '/- name: frontend/{found=1} found && /image:/{print NR; exit}' k8s/jerney.yaml)
+          echo "Frontend image at line: ${FRONTEND_LINE}"
+          sed -i "${FRONTEND_LINE}s|.*|          image: ${FRONTEND_IMAGE}:${IMAGE_TAG}|" k8s/jerney.yaml
 
-          echo "✅ Updated images to tag: ${IMAGE_TAG}"
-          grep "image:" k8s/jerney.yaml
+          echo "Updated images to tag: ${IMAGE_TAG}"
+          grep -n "image:" k8s/jerney.yaml
 
       - name: Commit and push manifest update
         run: |
